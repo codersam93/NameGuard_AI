@@ -229,15 +229,24 @@ def _load_data():
                 if not candidate: continue
                 
                 key = simple_phonetic_key(candidate)
+                decision = str(row.get("decision") or "").strip().lower()
+                
                 DATA.historical_decisions.append(IndexedTerm(
                     term=candidate,
                     key=key,
                     metadata={
                         "decision_dt": row.get("decision_dt"),
-                        "decision": str(row.get("decision") or "").strip().lower(),
+                        "decision": decision,
                         "score_at_time": row.get("score_at_time")
                     }
                 ))
+                
+                # CRITICAL FIX: If a name was accepted in history, treat it as an EXISTING COMPANY
+                # This ensures that new applications for the same name are flagged as "Too Similar"
+                if decision == "accepted":
+                    DATA.existing_companies.append(IndexedTerm(candidate, key, {}))
+                    DATA.existing_company_keys.add(key)
+                    
         except Exception: pass
 
 # Load data on module import
@@ -472,16 +481,24 @@ def aggregate_score(name: str) -> Tuple[float, List[RuleFlag], List[str]]:
     flags = compute_hard_rule_flags(name)
     explanations: List[str] = []
 
-    hist_prob = historical_acceptance_from_phonetics(name)
-    if hist_prob is None:
-        hist_prob = 0.5
+    # Base score starts high for a clean name
+    score = 0.95
 
-    score = hist_prob
-    explanations.append(f"Historical MCA decisions suggest an acceptance ratio around {hist_prob * 100:.0f}%.")
-
+    # 1. Uniqueness Penalty
+    # If name is similar to existing companies (including historically accepted ones), uniqueness_score drops.
     uniq = uniqueness_score(name)
-    score = 0.7 * score + 0.3 * uniq
+    score = score * uniq
     explanations.append(f"Distinguishability from existing names is estimated at {uniq * 100:.0f}%.")
+
+    # 2. Historical Rejection Penalty
+    # We only care if history suggests REJECTION.
+    # If history suggests ACCEPTANCE, it's already covered by uniqueness_score (because accepted names are now in existing_companies).
+    hist_prob = historical_acceptance_from_phonetics(name)
+    if hist_prob is not None:
+        if hist_prob < 0.4:
+            score = min(score, 0.4)
+            explanations.append(f"Historical data indicates similar names have been rejected (Approval rate: {hist_prob * 100:.0f}%).")
+        # We don't boost score based on history, because "Accepted" means "Taken".
 
     hard_severity = sum(f.severity for f in flags)
 
