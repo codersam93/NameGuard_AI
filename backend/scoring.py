@@ -461,20 +461,24 @@ def uniqueness_score(name: str) -> float:
     if not DATA.existing_company_keys:
         return 1.0
     
-    # Optimization: Only check similarity against keys that are somewhat close?
-    # But uniqueness_score iterates ALL keys.
-    # If existing_company_keys is large (e.g. 10k), this is 10k levenshtein calls.
-    # Levenshtein is O(N*M). 10k * 10 * 10 is fast enough in Python?
-    # Maybe. But let's optimize if possible.
-    # For now, we'll leave it as is, assuming the set isn't huge in the sample.
-    # If it is huge, we should use a BK-tree or similar.
-    
-    # Let's just sample or limit if it's too big?
-    # Or just rely on the fact that we only have a sample file.
-    
     sims = [similarity(key, other) for other in DATA.existing_company_keys]
     max_sim = max(sims) if sims else 0.0
-    return max(0.0, 1.0 - max_sim)
+    
+    # If max_sim is low (e.g. < 0.3), we can consider it effectively 0 for penalty purposes
+    # to allow high scores for distinct names.
+    # Let's map similarity to a penalty curve.
+    # If sim < 0.3, penalty = 0.
+    # If sim > 0.8, penalty = 1.0.
+    
+    if max_sim < 0.3:
+        penalty = 0.0
+    elif max_sim > 0.8:
+        penalty = 1.0
+    else:
+        # Linear interpolation between 0.3 and 0.8
+        penalty = (max_sim - 0.3) / (0.8 - 0.3)
+        
+    return 1.0 - penalty
 
 
 def aggregate_score(name: str) -> Tuple[float, List[RuleFlag], List[str]]:
