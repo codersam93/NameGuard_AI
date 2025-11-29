@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple, Optional, NamedTuple
@@ -241,8 +242,7 @@ def _load_data():
                     }
                 ))
                 
-                # CRITICAL FIX: If a name was accepted in history, treat it as an EXISTING COMPANY
-                # This ensures that new applications for the same name are flagged as "Too Similar"
+                # If a name was accepted in history, treat it as an EXISTING COMPANY
                 if decision == "accepted":
                     DATA.existing_companies.append(IndexedTerm(candidate, key, {}))
                     DATA.existing_company_keys.add(key)
@@ -277,8 +277,6 @@ def check_phonetic_match_optimized(name: str, candidates: List[IndexedTerm], thr
     
     for item in candidates:
         # Fast filter: key similarity
-        # If keys are very different, skip.
-        # We use a loose threshold because simple_phonetic_key is lossy.
         if similarity(name_key, item.key) < threshold:
             continue
             
@@ -306,11 +304,8 @@ def check_phonetic_match_any_token_optimized(name: str, candidates: List[Indexed
             if phonetic_match(token, item.term):
                 matches.append(item)
                 matched = True
-                break # Found a match for this candidate, move to next candidate
+                break 
         
-        # If we want all matches, we shouldn't break. But usually we just need to know if it matches.
-        # The caller expects a list of matches.
-    
     return matches
 
 
@@ -320,6 +315,20 @@ def check_phonetic_match_any_token_optimized(name: str, candidates: List[Indexed
 
 
 def historical_acceptance_from_phonetics(name: str) -> Optional[float]:
+    """
+    Calculates the likelihood of acceptance based on historical decisions.
+    
+    Logic:
+    - Finds all phonetic matches in historical data.
+    - Calculates a weighted average of outcomes (Accepted=1.0, Rejected=0.0).
+    - Weights are determined by Recency.
+    - Frequency is inherently handled by summing up all matching occurrences.
+      (e.g., 5 rejections contribute 5x the weight of 1 rejection, adjusted for recency).
+    
+    Returns:
+        Float between 0.0 and 1.0 representing historical approval rate.
+        None if no history found.
+    """
     if not DATA.historical_decisions:
         return None
 
@@ -338,8 +347,15 @@ def historical_acceptance_from_phonetics(name: str) -> Optional[float]:
         if dt_val is None or pd.isna(dt_val):
             continue
 
+        # Recency Weight Calculation
+        # More recent = Higher weight
         age_days = max(0.0, (now - dt_val).total_seconds() / 86400.0)
         age_years = age_days / 365.25
+        
+        # Decay function: 1 / (1 + age_years)
+        # 0 years -> 1.0
+        # 1 year -> 0.5
+        # 2 years -> 0.33
         w_recency = 1.0 / (1.0 + age_years)
 
         decision_str = item.metadata.get("decision")
@@ -350,6 +366,8 @@ def historical_acceptance_from_phonetics(name: str) -> Optional[float]:
         else:
             outcome = 1.0 if decision_str == "accepted" else 0.0
 
+        # Accumulate weighted outcome
+        # Frequency is handled here: each occurrence adds to the sum
         numer += w_recency * outcome
         denom += w_recency
 
@@ -368,7 +386,7 @@ def compute_hard_rule_flags(name: str) -> List[RuleFlag]:
     flags: List[RuleFlag] = []
     lowered = name.lower()
 
-    # 1) Prohibited / reserved phrases (exact substring match)
+    # 1) Prohibited / reserved phrases
     for item in DATA.prohibited_terms:
         if item.term in lowered:
             flags.append(RuleFlag(
@@ -377,7 +395,7 @@ def compute_hard_rule_flags(name: str) -> List[RuleFlag]:
                 severity=item.metadata["severity"]
             ))
 
-    # 2) Offensive / abusive words (exact token-based match)
+    # 2) Offensive / abusive words
     tokens = re.findall(r"[a-zA-Z]+", lowered)
     offensive_dict = {item.term: item for item in DATA.offensive_words}
     
@@ -390,7 +408,7 @@ def compute_hard_rule_flags(name: str) -> List[RuleFlag]:
                 severity=item.metadata["severity"]
             ))
 
-    # 3) Phonetic match against offensive words list
+    # 3) Phonetic match against offensive words
     has_offensive_flag = any(f.code == "obscene_or_offensive" for f in flags)
     if not has_offensive_flag:
         matches = check_phonetic_match_any_token_optimized(name, DATA.offensive_words)
@@ -400,9 +418,9 @@ def compute_hard_rule_flags(name: str) -> List[RuleFlag]:
                 description=f"Contains word that is phonetically similar to offensive term '{item.term}' in language '{item.metadata['lang']}'.",
                 severity=max(item.metadata["severity"], 0.9)
             ))
-            break # Only report one
+            break 
 
-    # 4) Phonetic match against prohibited / reserved terms
+    # 4) Phonetic match against prohibited terms
     has_prohibited_flag = any(f.code == "prohibited_or_reserved_term" for f in flags)
     if not has_prohibited_flag:
         matches = check_phonetic_match_any_token_optimized(name, DATA.prohibited_terms)
@@ -414,7 +432,7 @@ def compute_hard_rule_flags(name: str) -> List[RuleFlag]:
             ))
             break
 
-    # 5) Near-identical to existing companies (phonetic)
+    # 5) Near-identical to existing companies
     matches = check_phonetic_match_optimized(name, DATA.existing_companies)
     for item in matches:
         flags.append(RuleFlag(
@@ -464,18 +482,11 @@ def uniqueness_score(name: str) -> float:
     sims = [similarity(key, other) for other in DATA.existing_company_keys]
     max_sim = max(sims) if sims else 0.0
     
-    # If max_sim is low (e.g. < 0.3), we can consider it effectively 0 for penalty purposes
-    # to allow high scores for distinct names.
-    # Let's map similarity to a penalty curve.
-    # If sim < 0.3, penalty = 0.
-    # If sim > 0.8, penalty = 1.0.
-    
     if max_sim < 0.3:
         penalty = 0.0
     elif max_sim > 0.8:
         penalty = 1.0
     else:
-        # Linear interpolation between 0.3 and 0.8
         penalty = (max_sim - 0.3) / (0.8 - 0.3)
         
     return 1.0 - penalty
@@ -489,21 +500,18 @@ def aggregate_score(name: str) -> Tuple[float, List[RuleFlag], List[str]]:
     score = 0.95
 
     # 1. Uniqueness Penalty
-    # If name is similar to existing companies (including historically accepted ones), uniqueness_score drops.
     uniq = uniqueness_score(name)
     score = score * uniq
     explanations.append(f"Distinguishability from existing names is estimated at {uniq * 100:.0f}%.")
 
     # 2. Historical Rejection Penalty
-    # We only care if history suggests REJECTION.
-    # If history suggests ACCEPTANCE, it's already covered by uniqueness_score (because accepted names are now in existing_companies).
     hist_prob = historical_acceptance_from_phonetics(name)
     if hist_prob is not None:
-        if hist_prob < 0.4:
+        # If historical approval rate is low (< 50%), apply penalty
+        if hist_prob < 0.5:
             score = min(score, 0.4)
             explanations.append(f"Historical data indicates similar names have been rejected (Approval rate: {hist_prob * 100:.0f}%).")
-        # We don't boost score based on history, because "Accepted" means "Taken".
-
+        
     hard_severity = sum(f.severity for f in flags)
 
     has_high_offensive = any(f.code == "obscene_or_offensive" and f.severity >= 0.9 for f in flags)
